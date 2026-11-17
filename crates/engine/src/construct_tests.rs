@@ -869,13 +869,11 @@ fn plane_at_angle_axis_origin_expressions_follow_their_parameters() {
     let same = |a: Plane, b: Plane| near(a.origin, b.origin) && near(a.x, b.x) && near(a.y, b.y);
     assert!(same(plane(&s, "Expr"), plane(&s, "Numbers")), "{:?} {:?}", plane(&s, "Expr"), plane(&s, "Numbers"));
     // XY turned 30 deg about the line through (r, 0, h) along Y: its origin, which is (-r, 0, -h)
-    // from that point, turns about the line.
-    let expected = |r: f64, h: f64| {
-        let (c, sn) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
-        // Turning (x, z) counterclockwise about +Y: x' = x cos + z sin, z' = -x sin + z cos.
-        Vec3::new(r + (-r * c + -h * sn), 0.0, h + (r * sn + -h * c))
-    };
-    assert!(near(plane(&s, "Expr").origin, expected(12.0, 5.0)), "{:?}", plane(&s, "Expr"));
+    // from that point, turns about the line. Worked out in advance for each (r, h) the test uses.
+    let at_r12_h5 = Vec3::new(-0.892_305, 0.0, 6.669_873);
+    let at_r20_h5 = Vec3::new(0.179_492, 0.0, 10.669_873);
+    let at_r20_h8 = Vec3::new(-1.320_508, 0.0, 11.071_797);
+    assert!(near(plane(&s, "Expr").origin, at_r12_h5), "{:?}", plane(&s, "Expr"));
     // The saved origin keeps the expressions; plain numbers stay numbers.
     let saved = |s: &Session, name: &str| {
         let f = s.doc.features.iter().find(|f| f.name == name).unwrap_or_else(|| panic!("no {name}"));
@@ -884,14 +882,53 @@ fn plane_at_angle_axis_origin_expressions_follow_their_parameters() {
     assert_eq!(saved(&s, "Expr"), json!(["r", "0 mm", "h"]));
     assert_eq!(saved(&s, "Numbers"), json!([12.0, 0.0, 5.0]));
     run(&mut s, "parameters.change", json!({"name": "r", "expression": "20 mm"}));
-    assert!(near(plane(&s, "Expr").origin, expected(20.0, 5.0)), "{:?}", plane(&s, "Expr"));
-    assert!(near(plane(&s, "Numbers").origin, expected(12.0, 5.0)), "{:?}", plane(&s, "Numbers"));
+    assert!(near(plane(&s, "Expr").origin, at_r20_h5), "{:?}", plane(&s, "Expr"));
+    assert!(near(plane(&s, "Numbers").origin, at_r12_h5), "{:?}", plane(&s, "Numbers"));
     run(&mut s, "parameters.rename", json!({"name": "h", "new_name": "height"}));
     run(&mut s, "parameters.change", json!({"name": "height", "expression": "8 mm"}));
-    assert!(near(plane(&s, "Expr").origin, expected(20.0, 8.0)), "{:?}", plane(&s, "Expr"));
+    assert!(near(plane(&s, "Expr").origin, at_r20_h8), "{:?}", plane(&s, "Expr"));
     assert_eq!(saved(&s, "Expr"), json!(["r", "0 mm", "height"]));
     let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
-    assert!(near(plane(&reopened, "Expr").origin, expected(20.0, 8.0)), "{:?}", plane(&reopened, "Expr"));
+    assert!(near(plane(&reopened, "Expr").origin, at_r20_h8), "{:?}", plane(&reopened, "Expr"));
+}
+
+/// A saved numeric axis origin at the edge of what a design may hold (1e9 mm, the bound checked
+/// when it opens) still rebuilds; an expression origin beyond it is still refused.
+#[test]
+fn plane_at_angle_saved_numeric_axis_origin_far_away_still_rebuilds() {
+    let mut s = Session::default();
+    for (name, direction_only) in [("Turned", false), ("DirectionOnly", true)] {
+        run(
+            &mut s,
+            "construct.plane.at_angle",
+            json!({"base": "XY", "axis": {"origin": [1, 0, 0], "dir": [0, 1, 0]}, "angle": "90 deg", "direction_only": direction_only, "name": name}),
+        );
+    }
+    // Move the saved origins to the bound, as an older design could hold them.
+    let mut saved: Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    for f in saved["features"].as_array_mut().unwrap() {
+        if let Some(origin) = f.pointer_mut("/plane/axis_origin") {
+            *origin = json!([1e9, 0, 0]);
+        }
+    }
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&saved.to_string()).unwrap());
+    // XY turned 90 deg about the line through (1e9, 0, 0) along Y: the origin goes to (1e9, 0, 1e9).
+    let turned = plane(&reopened, "Turned");
+    assert!((turned.origin.x - 1e9).abs() < 1.0 && (turned.origin.z - 1e9).abs() < 1.0, "{turned:?}");
+    // With direction_only the origin is unused: the plane turns about Y through the base origin.
+    assert!(near(plane(&reopened, "DirectionOnly").origin, Vec3::ZERO), "{:?}", plane(&reopened, "DirectionOnly"));
+
+    // An expression that works out past 1e9 mm is still out of range when the design rebuilds.
+    run(&mut s, "parameters.add", json!({"name": "far", "expression": "1000000001 mm"}));
+    let mut saved: Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    for f in saved["features"].as_array_mut().unwrap() {
+        if f["name"] == "Turned" {
+            f["plane"]["axis_origin"] = json!(["far", 0, 0]);
+        }
+    }
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&saved.to_string()).unwrap());
+    let error = reopened.model.results.iter().find(|r| r.name == "Turned").and_then(|r| r.error.clone());
+    assert!(error.as_deref().is_some_and(|e| e.contains("out of range")), "{error:?}");
 }
 
 /// A construction plane named like an origin plane, as an older saved design can hold.
